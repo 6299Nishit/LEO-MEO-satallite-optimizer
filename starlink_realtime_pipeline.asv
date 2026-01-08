@@ -1,0 +1,148 @@
+%% ============================================================
+%  STARLINK-STYLE REAL-TIME SATELLITE GROUND STATION
+%  SDR → DSP → SNR/Doppler/Delay → AI → Handover → SDR Retune
+%% ============================================================
+
+clc; clear; close all;
+
+%% ---------------- USER CONFIGURATION ----------------
+satNames = {'SAT-1','SAT-2','SAT-3'};
+satFreq  = [137e6, 145e6, 435e6];     % Demo receivable bands
+orbitKm  = [550, 600, 700];           % LEO altitudes
+velocity = [7.6, 7.5, 7.4]*1e3;       % m/s
+N = numel(satFreq);
+
+fs  = 1e6;                            % Sample rate
+spf = 4096;                           % Samples per frame
+BW  = 10e6;                           % Bandwidth (for throughput)
+c   = 3e8;
+
+lockDuration = 5;                     % Make-before-break lock
+hysteresis   = 2.0;                   % Score margin
+T = 200;                              % Runtime frames
+
+%% ---------------- INITIALIZE SDR ----------------
+rx = comm.SDRRTLReceiver( ...
+    'CenterFrequency', 137e6, ...
+    'SampleRate', 1e6, ...
+    'SamplesPerFrame', 4096, ...
+    'OutputDataType', 'double');
+
+
+disp('✅ SDR initialized – starting real-time processing');
+
+%% ---------------- SIGNAL PROCESSING BLOCKS ----------------
+rrc = rcosdesign(0.35,6,4);            % Matched filter
+
+carrierSync = comm.CarrierSynchronizer( ...
+    'Modulation','QPSK', ...
+    'SamplesPerSymbol',4);
+
+timingSync = comm.SymbolSynchronizer( ...
+    'TimingErrorDetector','Gardner', ...
+    'SamplesPerSymbol',4);
+
+demod = comm.QPSKDemodulator( ...
+    'BitOutput',true, ...
+    'DecisionMethod','Hard decision');
+
+%% ---------------- AI / OPTIMIZER STATE ----------------
+currentSat = 1;
+lockTimer  = 0;
+scoreHist  = zeros(3,N);
+
+logActive  = zeros(T,1);
+logScore   = zeros(T,N);
+
+%% ===================== REAL-TIME LOOP ======================
+for t = 1:T
+
+    SNR = zeros(1,N);
+    Doppler = zeros(1,N);
+    Delay = zeros(1,N);
+
+    %% ----------- SCAN ALL NEARBY SATELLITES -----------
+    for i = 1:N
+        rx.CenterFrequency = satFreq(i);
+        iq = rx();                           % LIVE RF
+
+        %% ---- MATLAB SIGNAL PROCESSING ----
+        filtSig = filter(rrc,1,iq);
+        symSig  = timingSync(filtSig);
+        carrSig = carrierSync(symSig);
+
+        %% ---- REAL METRICS ----
+        sigPower   = mean(abs(carrSig).^2);
+        noisePower = var(carrSig - mean(carrSig));
+        SNR(i)     = 10*log10(sigPower/(noisePower+eps));
+
+        % Doppler estimate (FFT peak shift)
+        X = fftshift(fft(iq));
+        [~,idx] = max(abs(X));
+        freqAxis = linspace(-fs/2,fs/2,length(X));
+        Doppler(i) = freqAxis(idx);
+
+        % Delay from geometry
+        elevation = rand*(pi/2);
+        slant = (orbitKm(i)*1e3)/sin(elevation);
+        Delay(i) = (slant/c)*1e3;            % ms
+    end
+
+    %% ----------- AI OPTIMIZER (LINK SCORE) -----------
+    Throughput = BW*log2(1+10.^(SNR/10))/1e6;
+
+    score = ...
+        0.3*SNR + ...
+        0.4*Throughput - ...
+        0.2*Delay - ...
+        0.1*abs(Doppler);
+
+    scoreHist = [scoreHist(2:end,:); score];
+
+    if t < 3
+        predictedScore = mean(scoreHist,1);
+    else
+        predictedScore = ml_predict_score(scoreHist);
+    end
+
+    %% ----------- BEST SATELLITE DECISION -----------
+    [~, bestSat] = max(predictedScore);
+
+    %% ----------- HANDOVER TRIGGER & SDR RETUNE -----------
+    if lockTimer == 0 && bestSat ~= currentSat && ...
+       (predictedScore(bestSat)-predictedScore(currentSat)) > hysteresis
+
+        fprintf('⚡ Handover: %s → %s\n', ...
+            satNames{currentSat}, satNames{bestSat});
+
+        rx.CenterFrequency = satFreq(bestSat);  % SDR retune
+        currentSat = bestSat;
+        lockTimer  = lockDuration;
+    else
+        lockTimer = max(lockTimer-1,0);
+    end
+
+    %% ----------- LOGGING -----------
+    logActive(t) = currentSat;
+    logScore(t,:) = score;
+
+    fprintf('t=%03d | Active=%s | SNR=%s\n', ...
+        t, satNames{currentSat}, mat2str(round(SNR,2)));
+end
+
+release(rx);
+
+%% ===================== VISUALIZATION ======================
+figure;
+subplot(2,1,1);
+plot(logScore,'LineWidth',1.2);
+grid on; legend(satNames);
+title('Link Score (DSP + AI)');
+
+subplot(2,1,2);
+stairs(logActive,'LineWidth',2);
+yticks(1:N); yticklabels(satNames);
+xlabel('Time Frame');
+ylabel('Active Satellite');
+title('Seamless AI-Based Handover');
+grid on;
